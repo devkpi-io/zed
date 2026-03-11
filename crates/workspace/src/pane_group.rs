@@ -584,54 +584,89 @@ pub struct PaneAxisState(Rc<RefCell<PaneAxisStateInner>>);
 
 #[derive(Debug)]
 struct PaneAxisStateInner {
-    flexes: Vec<f32>,
-    bounding_boxes: Vec<Option<Bounds<Pixels>>>,
+    left_entry: Option<PaneAxisStateEntry>,
+    right_entry: Option<PaneAxisStateEntry>,
+    entries: Vec<PaneAxisStateEntry>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PaneAxisStateEntry {
+    flex: f32,
+    bounding_box: Option<Bounds<Pixels>>,
 }
 
 impl PaneAxisState {
     pub fn new(member_count: usize) -> Self {
         Self(Rc::new(RefCell::new(PaneAxisStateInner {
-            flexes: vec![1.; member_count],
-            bounding_boxes: vec![None; member_count],
+            left_entry: None,
+            right_entry: None,
+            entries: vec![
+                PaneAxisStateEntry {
+                    flex: 1.,
+                    bounding_box: None
+                };
+                member_count
+            ],
         })))
     }
 
     fn with_flexes(flexes: Vec<f32>) -> Self {
-        let member_count = flexes.len();
         Self(Rc::new(RefCell::new(PaneAxisStateInner {
-            flexes,
-            bounding_boxes: vec![None; member_count],
+            left_entry: None,
+            right_entry: None,
+            entries: flexes
+                .into_iter()
+                .map(|flex| PaneAxisStateEntry {
+                    flex,
+                    bounding_box: None,
+                })
+                .collect(),
         })))
     }
 
     pub fn flexes(&self) -> Vec<f32> {
-        self.0.borrow().flexes.clone()
+        self.0.borrow().entries.iter().map(|e| e.flex).collect()
     }
 
     pub fn len(&self) -> usize {
-        self.0.borrow().flexes.len()
+        self.0.borrow().entries.len()
     }
 
     fn resize(&self, len: usize) {
         let mut inner = self.0.borrow_mut();
-        inner.flexes.clear();
-        inner.flexes.resize(len, 1.);
-        inner.bounding_boxes.clear();
-        inner.bounding_boxes.resize(len, None);
+        inner.entries.clear();
+        inner.entries.resize(
+            len,
+            PaneAxisStateEntry {
+                flex: 1.,
+                bounding_box: None,
+            },
+        );
     }
 
     fn reset_flexes(&self) {
         let mut inner = self.0.borrow_mut();
-        inner.flexes.iter_mut().for_each(|f| *f = 1.);
-        inner.bounding_boxes.iter_mut().for_each(|f| *f = None);
-    }
-
-    fn bounding_boxes(&self) -> Vec<Option<Bounds<Pixels>>> {
-        self.0.borrow().bounding_boxes.clone()
+        inner.entries.iter_mut().for_each(|e| {
+            e.flex = 1.;
+            e.bounding_box = None;
+        });
     }
 
     fn bounding_box_at(&self, index: usize) -> Option<Bounds<Pixels>> {
-        self.0.borrow().bounding_boxes[index]
+        self.0
+            .borrow()
+            .entries
+            .get(index)
+            .and_then(|e| e.bounding_box)
+    }
+
+    fn bounds(&self) -> Option<Bounds<Pixels>> {
+        self.0
+            .borrow()
+            .entries
+            .iter()
+            .filter_map(|e| e.bounding_box)
+            .reduce(|acc, e| acc.union(&e))
     }
 }
 
@@ -778,14 +813,7 @@ impl PaneAxis {
         amount: Pixels,
         bounds: &Bounds<Pixels>,
     ) -> Option<bool> {
-        let container_size = self
-            .state
-            .bounding_boxes()
-            .iter()
-            .filter_map(|e| *e)
-            .reduce(|acc, e| acc.union(&e))
-            .unwrap_or(*bounds)
-            .size;
+        let container_size = self.state.bounds().unwrap_or(*bounds).size;
 
         let found_pane = self
             .members
@@ -818,7 +846,6 @@ impl PaneAxis {
             Axis::Vertical => px(VERTICAL_MIN_SIZE),
         };
         let mut state = self.state.0.borrow_mut();
-        let flexes = &mut state.flexes;
 
         let ix = if found_pane {
             self.members.iter().position(|m| {
@@ -838,46 +865,48 @@ impl PaneAxis {
 
         let ix = ix.unwrap_or(0);
 
-        let size = move |ix, flexes: &[f32]| {
-            container_size.along(axis) * (flexes[ix] / flexes.len() as f32)
+        let size = move |ix: usize, state: &PaneAxisStateInner| {
+            container_size.along(axis) * (state.entries[ix].flex / state.entries.len() as f32)
         };
 
         // Don't allow resizing to less than the minimum size, if elements are already too small
-        if min_size - px(1.) > size(ix, flexes.as_slice()) {
+        if min_size - px(1.) > size(ix, &state) {
             return Some(true);
         }
 
-        let flex_changes = |pixel_dx, target_ix, next: isize, flexes: &[f32]| {
-            let flex_change = flexes.len() as f32 * pixel_dx / container_size.along(axis);
-            let current_target_flex = flexes[target_ix] + flex_change;
-            let next_target_flex = flexes[(target_ix as isize + next) as usize] - flex_change;
+        let flex_changes = |pixel_dx, target_ix: usize, next: isize, state: &PaneAxisStateInner| {
+            let flex_change = state.entries.len() as f32 * pixel_dx / container_size.along(axis);
+            let current_target_flex = state.entries[target_ix].flex + flex_change;
+            let next_target_flex =
+                state.entries[(target_ix as isize + next) as usize].flex - flex_change;
             (current_target_flex, next_target_flex)
         };
 
-        let apply_changes =
-            |current_ix: usize, proposed_current_pixel_change: Pixels, flexes: &mut [f32]| {
-                let next_target_size = Pixels::max(
-                    size(current_ix + 1, flexes) - proposed_current_pixel_change,
-                    min_size,
-                );
-                let current_target_size = Pixels::max(
-                    size(current_ix, flexes) + size(current_ix + 1, flexes) - next_target_size,
-                    min_size,
-                );
+        let apply_changes = |current_ix: usize,
+                             proposed_current_pixel_change: Pixels,
+                             state: &mut PaneAxisStateInner| {
+            let next_target_size = Pixels::max(
+                size(current_ix + 1, state) - proposed_current_pixel_change,
+                min_size,
+            );
+            let current_target_size = Pixels::max(
+                size(current_ix, state) + size(current_ix + 1, state) - next_target_size,
+                min_size,
+            );
 
-                let current_pixel_change = current_target_size - size(current_ix, flexes);
+            let current_pixel_change = current_target_size - size(current_ix, state);
 
-                let (current_target_flex, next_target_flex) =
-                    flex_changes(current_pixel_change, current_ix, 1, flexes);
+            let (current_target_flex, next_target_flex) =
+                flex_changes(current_pixel_change, current_ix, 1, state);
 
-                flexes[current_ix] = current_target_flex;
-                flexes[current_ix + 1] = next_target_flex;
-            };
+            state.entries[current_ix].flex = current_target_flex;
+            state.entries[current_ix + 1].flex = next_target_flex;
+        };
 
-        if ix + 1 == flexes.len() {
-            apply_changes(ix - 1, -1.0 * amount, flexes.as_mut_slice());
+        if ix + 1 == state.entries.len() {
+            apply_changes(ix - 1, -1.0 * amount, &mut *state);
         } else {
-            apply_changes(ix, amount, flexes.as_mut_slice());
+            apply_changes(ix, amount, &mut *state);
         }
         Some(true)
     }
@@ -920,10 +949,8 @@ impl PaneAxis {
     fn pane_at_pixel_position(&self, coordinate: Point<Pixels>) -> Option<&Entity<Pane>> {
         debug_assert!(self.members.len() == self.state.len());
 
-        let bounding_boxes = self.state.bounding_boxes();
-
         for (idx, member) in self.members.iter().enumerate() {
-            if let Some(coordinates) = bounding_boxes[idx]
+            if let Some(coordinates) = self.state.bounding_box_at(idx)
                 && coordinates.contains(&coordinate)
             {
                 return match member {
@@ -1103,6 +1130,7 @@ pub mod element {
     use crate::Workspace;
 
     use crate::WorkspaceSettings;
+    use crate::pane_group::PaneAxisStateInner;
 
     use super::{HANDLE_HITBOX_SIZE, HORIZONTAL_MIN_SIZE, PaneAxisState, VERTICAL_MIN_SIZE};
 
@@ -1180,32 +1208,33 @@ pub mod element {
                 Axis::Vertical => px(VERTICAL_MIN_SIZE),
             };
             let mut inner = state.0.borrow_mut();
-            let flexes = &mut inner.flexes;
-            debug_assert!(flex_values_in_bounds(flexes.as_slice()));
+            debug_assert!(flex_values_in_bounds(&*inner));
 
             // Math to convert a flex value to a pixel value
-            let size = move |ix, flexes: &[f32]| {
-                container_size.along(axis) * (flexes[ix] / flexes.len() as f32)
+            let size = move |ix: usize, state: &PaneAxisStateInner| {
+                container_size.along(axis) * (state.entries[ix].flex / state.entries.len() as f32)
             };
 
             // Don't allow resizing to less than the minimum size, if elements are already too small
-            if min_size - px(1.) > size(ix, flexes.as_slice()) {
+            if min_size - px(1.) > size(ix, &*inner) {
                 return;
             }
 
             // This is basically a "bucket" of pixel changes that need to be applied in response to this
             // mouse event. Probably a small, fractional number like 0.5 or 1.5 pixels
             let mut proposed_current_pixel_change =
-                (e.position - child_start).along(axis) - size(ix, flexes.as_slice());
+                (e.position - child_start).along(axis) - size(ix, &*inner);
 
             // This takes a pixel change, and computes the flex changes that correspond to this pixel change
             // as well as the next one, for some reason
-            let flex_changes = |pixel_dx, target_ix, next: isize, flexes: &[f32]| {
-                let flex_change = pixel_dx / container_size.along(axis);
-                let current_target_flex = flexes[target_ix] + flex_change;
-                let next_target_flex = flexes[(target_ix as isize + next) as usize] - flex_change;
-                (current_target_flex, next_target_flex)
-            };
+            let flex_changes =
+                |pixel_dx, target_ix: usize, next: isize, state: &PaneAxisStateInner| {
+                    let flex_change = pixel_dx / container_size.along(axis);
+                    let current_target_flex = state.entries[target_ix].flex + flex_change;
+                    let next_target_flex =
+                        state.entries[(target_ix as isize + next) as usize].flex - flex_change;
+                    (current_target_flex, next_target_flex)
+                };
 
             // Generate the list of flex successors, from the current index.
             // If you're dragging column 3 forward, out of 6 columns, then this code will produce [4, 5, 6]
@@ -1213,7 +1242,7 @@ pub mod element {
             let mut successors = iter::from_fn({
                 let forward = proposed_current_pixel_change > px(0.);
                 let mut ix_offset = 0;
-                let len = flexes.len();
+                let len = inner.entries.len();
                 move || {
                     let result = if forward {
                         (ix + 1 + ix_offset < len).then(|| ix + ix_offset)
@@ -1234,24 +1263,22 @@ pub mod element {
                 };
 
                 let next_target_size = Pixels::max(
-                    size(current_ix + 1, flexes.as_slice()) - proposed_current_pixel_change,
+                    size(current_ix + 1, &*inner) - proposed_current_pixel_change,
                     min_size,
                 );
 
                 let current_target_size = Pixels::max(
-                    size(current_ix, flexes.as_slice()) + size(current_ix + 1, flexes.as_slice())
-                        - next_target_size,
+                    size(current_ix, &*inner) + size(current_ix + 1, &*inner) - next_target_size,
                     min_size,
                 );
 
-                let current_pixel_change =
-                    current_target_size - size(current_ix, flexes.as_slice());
+                let current_pixel_change = current_target_size - size(current_ix, &*inner);
 
                 let (current_target_flex, next_target_flex) =
-                    flex_changes(current_pixel_change, current_ix, 1, flexes.as_slice());
+                    flex_changes(current_pixel_change, current_ix, 1, &inner);
 
-                flexes[current_ix] = current_target_flex;
-                flexes[current_ix + 1] = next_target_flex;
+                inner.entries[current_ix].flex = current_target_flex;
+                inner.entries[current_ix + 1].flex = next_target_flex;
 
                 proposed_current_pixel_change -= current_pixel_change;
             }
@@ -1344,24 +1371,24 @@ pub mod element {
                     (state.clone(), state)
                 },
             );
-            let flexes = self.state.flexes();
+            let mut inner = self.state.0.borrow_mut();
             let len = self.children.len();
-            debug_assert!(flexes.len() == len);
-            debug_assert!(flex_values_in_bounds(flexes.as_slice()));
+            debug_assert!(inner.entries.len() == len);
+            debug_assert!(flex_values_in_bounds(&inner));
 
             let total_flex = len as f32;
 
             let mut origin = bounds.origin;
             let space_per_flex = bounds.size.along(self.axis) / total_flex;
 
-            self.state.0.borrow_mut().bounding_boxes.clear();
+            // self.state.0.borrow_mut().bounding_boxes.clear();
 
             let mut layout = PaneAxisLayout {
                 dragged_handle,
                 children: Vec::new(),
             };
             for (ix, mut child) in mem::take(&mut self.children).into_iter().enumerate() {
-                let child_flex = flexes[ix];
+                let child_flex = inner.entries[ix].flex;
 
                 let child_size = bounds
                     .size
@@ -1373,11 +1400,7 @@ pub mod element {
                     size: child_size,
                 };
 
-                self.state
-                    .0
-                    .borrow_mut()
-                    .bounding_boxes
-                    .push(Some(child_bounds));
+                inner.entries[ix].bounding_box = Some(child_bounds);
                 child.layout_as_root(child_size.into(), window, cx);
                 child.prepaint_at(origin, window, cx);
 
@@ -1558,7 +1581,8 @@ pub mod element {
         }
     }
 
-    fn flex_values_in_bounds(flexes: &[f32]) -> bool {
-        (flexes.iter().copied().sum::<f32>() - flexes.len() as f32).abs() < 0.001
+    fn flex_values_in_bounds(inner: &PaneAxisStateInner) -> bool {
+        (inner.entries.iter().map(|e| e.flex).sum::<f32>() - inner.entries.len() as f32).abs()
+            < 0.001
     }
 }
